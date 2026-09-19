@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix AI \u0026 DS Academic Hub",
+  "description": "Centralized academic portal for B.Tech CSE – Artificial Intelligence \u0026 Data Science students featuring complete syllabus, study material, practice questions, question papers, and progress tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
