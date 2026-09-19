@@ -21,7 +21,8 @@ import {
   Users,
   Trash2,
   Eye,
-  EyeOff
+  EyeOff,
+  Upload
 } from 'lucide-react';
 import { Subject, PracticeQuestion, QuestionPaper, StudentAccount } from '../types.ts';
 import { AcademicService } from '../services/academicService.ts';
@@ -57,11 +58,29 @@ export const AdminBackendExcelSheetTab: React.FC<AdminBackendExcelSheetTabProps>
   const [studentToDelete, setStudentToDelete] = useState<StudentAccount | null>(null);
   const [isConfirmClearAllOpen, setIsConfirmClearAllOpen] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [isImporting, setIsImporting] = useState<boolean>(false);
 
-  // Keep students in sync if updated
+  const fetchFreshStudents = async () => {
+    setIsSyncing(true);
+    try {
+      const fresh = await AcademicService.fetchStudentsFromServer();
+      setStudents(fresh);
+      setToastMessage(`Server synced: ${fresh.length} student account(s) loaded.`);
+      setTimeout(() => setToastMessage(null), 3000);
+    } catch (e) {
+      console.warn('Sync failed', e);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Keep students in sync if updated or tab switched
   useEffect(() => {
-    setStudents(AcademicService.getStudents());
-  }, [subjects]);
+    AcademicService.fetchStudentsFromServer().then(fresh => {
+      if (fresh) setStudents(fresh);
+    });
+  }, [subjects, activeSheet]);
 
   // Load live questions and question papers from service
   const allQuestions: PracticeQuestion[] = useMemo(() => {
@@ -370,6 +389,147 @@ export const AdminBackendExcelSheetTab: React.FC<AdminBackendExcelSheetTabProps>
     } catch (err) {
       console.error('Failed to export excel file', err);
       alert('Failed to generate Excel file. Please try again.');
+    }
+  };
+
+  // Dedicated Student Roster Excel Export (.xlsx)
+  const handleExportStudentsOnlyExcel = () => {
+    try {
+      const wb = XLSX.utils.book_new();
+      const currentList = AcademicService.getStudents();
+      const studentRosterData = currentList.map((stu, index) => ({
+        'Row #': index + 1,
+        'Student ID / UG Number': stu.ugNumber,
+        'Full Student Name': stu.fullName,
+        'Semester': `Semester ${stu.semester}`,
+        'Department': stu.department || 'Artificial Intelligence & Data Science',
+        'Academic Email': stu.email,
+        'Account Password': stu.password,
+        'Account Created At': new Date(stu.createdAt).toLocaleString(),
+        'Last Login At': stu.lastLoginAt ? new Date(stu.lastLoginAt).toLocaleString() : 'Never',
+        'Account Status': 'ACTIVE'
+      }));
+
+      const wsStudents = XLSX.utils.json_to_sheet(
+        studentRosterData.length > 0
+          ? studentRosterData
+          : [{ 'Status': 'No registered student accounts in database' }]
+      );
+      XLSX.utils.book_append_sheet(wb, wsStudents, 'AI & DS Students Roster');
+
+      const fileName = `AI_DS_Student_Accounts_Roster_${new Date().toISOString().split('T')[0]}.xlsx`;
+      XLSX.writeFile(wb, fileName);
+
+      setToastMessage(`Student accounts roster exported to ${fileName}`);
+      setTimeout(() => setToastMessage(null), 3000);
+    } catch (err) {
+      console.error('Failed to export student roster Excel', err);
+      alert('Failed to export student accounts. Please try again.');
+    }
+  };
+
+  // Import Student Roster from Excel / CSV
+  const handleImportStudentsExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsImporting(true);
+    try {
+      const buffer = await file.arrayBuffer();
+      const wb = XLSX.read(buffer, { type: 'array' });
+      const firstSheetName = wb.SheetNames[0];
+      const sheet = wb.Sheets[firstSheetName];
+      const rows: any[] = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+      if (!rows || rows.length === 0) {
+        alert('The uploaded Excel spreadsheet is empty.');
+        return;
+      }
+
+      const parsedStudents: StudentAccount[] = [];
+      for (const row of rows) {
+        const ug = (
+          row['Student ID / UG Number'] ||
+          row['Student ID'] ||
+          row['UG Number'] ||
+          row['UGNumber'] ||
+          row['Roll No'] ||
+          row['Roll Number'] ||
+          row['ugNumber'] ||
+          row['ID'] ||
+          ''
+        ).toString().trim().toUpperCase();
+
+        const name = (
+          row['Full Student Name'] ||
+          row['Student Name'] ||
+          row['Full Name'] ||
+          row['Name'] ||
+          row['fullName'] ||
+          ''
+        ).toString().trim();
+
+        if (!ug) continue;
+
+        const email = (
+          row['Academic Email'] ||
+          row['Email'] ||
+          row['Email ID'] ||
+          row['email'] ||
+          `${ug.toLowerCase()}@college.edu`
+        ).toString().trim();
+
+        const semesterRaw = (
+          row['Semester'] ||
+          row['Sem'] ||
+          row['semester'] ||
+          '1'
+        ).toString().replace(/[^0-9]/g, '');
+        const semester = parseInt(semesterRaw, 10) || 1;
+
+        const password = (
+          row['Account Password'] ||
+          row['Password'] ||
+          row['password'] ||
+          'Student@123'
+        ).toString().trim();
+
+        const department = (
+          row['Department'] ||
+          row['Dept'] ||
+          row['department'] ||
+          'Artificial Intelligence & Data Science'
+        ).toString().trim();
+
+        parsedStudents.push({
+          ugNumber: ug,
+          fullName: name || `Student (${ug})`,
+          email,
+          semester,
+          password: password || 'Student@123',
+          createdAt: Date.now(),
+          department
+        });
+      }
+
+      if (parsedStudents.length === 0) {
+        alert('No valid student entries found in the file. Please make sure the sheet includes columns for "Student ID / UG Number" and "Full Name".');
+        return;
+      }
+
+      const res = await AcademicService.bulkImportStudents(parsedStudents);
+      const fresh = await AcademicService.fetchStudentsFromServer();
+      setStudents(fresh);
+      onRefreshData();
+
+      setToastMessage(`Imported ${res.importedCount} new student account(s) into database! Total accounts: ${res.total}`);
+      setTimeout(() => setToastMessage(null), 4000);
+    } catch (err: any) {
+      console.error('Failed to import student Excel', err);
+      alert('Error parsing Excel spreadsheet: ' + (err?.message || 'Invalid format'));
+    } finally {
+      setIsImporting(false);
+      if (e.target) e.target.value = '';
     }
   };
 
@@ -1130,22 +1290,65 @@ export const AdminBackendExcelSheetTab: React.FC<AdminBackendExcelSheetTabProps>
           {/* ================= VIEW 5: STUDENT ACCOUNTS (UG NUMBER OF AI & DS) ================= */}
           {activeSheet === 'student_accounts' && (
             <div className="space-y-0">
-              <div className="p-3 bg-purple-50/70 dark:bg-purple-950/30 border-b border-purple-200/60 dark:border-purple-900/40 flex flex-wrap items-center justify-between gap-3 text-xs">
-                <div className="flex items-center gap-2 text-purple-900 dark:text-purple-200">
-                  <Users className="w-4 h-4 text-purple-600 dark:text-purple-400 shrink-0" />
-                  <span>
-                    <strong>Registered AI & DS Student Accounts Database</strong> — Student ID is the student's UG Number (Strict limit: each UG Number can only create 1 account).
+              <div className="p-3 bg-purple-50/70 dark:bg-purple-950/30 border-b border-purple-200/60 dark:border-purple-900/40 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2 text-purple-900 dark:text-purple-200">
+                  <div className="flex items-center gap-2">
+                    <Users className="w-4 h-4 text-purple-600 dark:text-purple-400 shrink-0" />
+                    <span className="font-bold">
+                      Registered AI & DS Student Accounts Database ({students.length})
+                    </span>
+                  </div>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 font-semibold text-[10px] border border-emerald-300 dark:border-emerald-800">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                    <span>Server Persistent Storage Active (Survives Rebuilds)</span>
                   </span>
                 </div>
-                <div className="flex items-center gap-2">
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={fetchFreshStudents}
+                    disabled={isSyncing}
+                    className="px-2.5 py-1 rounded-lg bg-white dark:bg-slate-800 border border-purple-200 dark:border-purple-800 text-purple-800 dark:text-purple-200 font-semibold text-[11px] flex items-center gap-1.5 hover:bg-purple-100/50 transition cursor-pointer disabled:opacity-60"
+                    title="Reload latest students directly from backend database"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                    <span>{isSyncing ? 'Syncing...' : 'Sync Server'}</span>
+                  </button>
+
+                  <label
+                    className={`px-2.5 py-1 rounded-lg bg-white dark:bg-slate-800 border border-purple-200 dark:border-purple-800 text-purple-800 dark:text-purple-200 font-semibold text-[11px] flex items-center gap-1.5 hover:bg-purple-100/50 transition cursor-pointer ${isImporting ? 'opacity-60 pointer-events-none' : ''}`}
+                    title="Upload existing student roster Excel (.xlsx, .xls) or CSV"
+                  >
+                    <Upload className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
+                    <span>{isImporting ? 'Importing...' : 'Import Excel'}</span>
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv"
+                      onChange={handleImportStudentsExcel}
+                      className="hidden"
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={handleExportStudentsOnlyExcel}
+                    className="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-700 text-white font-semibold text-[11px] flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                    title="Export all student accounts as dedicated .xlsx Excel spreadsheet"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Export Excel</span>
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => setShowPasswords(!showPasswords)}
                     className="px-2.5 py-1 rounded-lg bg-white dark:bg-slate-800 border border-purple-200 dark:border-purple-800 text-purple-800 dark:text-purple-200 font-semibold text-[11px] flex items-center gap-1.5 hover:bg-purple-100/50 transition cursor-pointer"
                   >
                     {showPasswords ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                    <span>{showPasswords ? 'Mask Passwords' : 'Show Passwords'}</span>
+                    <span>{showPasswords ? 'Mask' : 'Show Passwords'}</span>
                   </button>
+
                   {students.length > 0 && (
                     <button
                       id="btn-clear-all-students"
@@ -1154,7 +1357,7 @@ export const AdminBackendExcelSheetTab: React.FC<AdminBackendExcelSheetTabProps>
                       className="px-2.5 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 text-rose-700 dark:text-rose-300 font-semibold text-[11px] flex items-center gap-1 hover:bg-rose-100 dark:hover:bg-rose-900/50 transition cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
-                      <span>Clear All Accounts</span>
+                      <span>Clear All</span>
                     </button>
                   )}
                 </div>

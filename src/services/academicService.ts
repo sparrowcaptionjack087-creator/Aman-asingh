@@ -583,13 +583,14 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
     return JSON.stringify(
       {
         department: 'B.Tech CSE (Artificial Intelligence & Data Science)',
-        version: '2.0.0',
+        version: '2.1.0',
         exportedAt: new Date().toISOString(),
         subjects: this.getSubjects(),
         questions: this.getQuestions(),
         questionPapers: this.getQuestionPapers(),
         studentProgress: this.getStudentProgress(),
         classDiscussions: this.getClassDiscussions(),
+        students: this.getStudents(),
       },
       null,
       2
@@ -599,7 +600,7 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
   static importDataFromJSON(jsonString: string): {
     success: boolean;
     message: string;
-    counts?: { subjects: number; questions: number; papers: number };
+    counts?: { subjects: number; questions: number; papers: number; students?: number };
   } {
     try {
       const data = typeof jsonString === 'string' ? JSON.parse(jsonString) : jsonString;
@@ -607,6 +608,7 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
       let importedSubjects = 0;
       let importedQuestions = 0;
       let importedPapers = 0;
+      let importedStudents = 0;
 
       if (Array.isArray(data.subjects) && data.subjects.length > 0) {
         this.saveSubjects(data.subjects);
@@ -626,18 +628,22 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
       if (data.studentProgress) {
         this.saveStudentProgress(data.studentProgress);
       }
+      if (Array.isArray(data.students) && data.students.length > 0) {
+        this.bulkImportStudents(data.students);
+        importedStudents = data.students.length;
+      }
 
-      if (importedSubjects === 0 && importedQuestions === 0 && importedPapers === 0) {
+      if (importedSubjects === 0 && importedQuestions === 0 && importedPapers === 0 && importedStudents === 0) {
         return {
           success: false,
-          message: 'The uploaded JSON file did not contain valid subjects, questions, or papers data.'
+          message: 'The uploaded JSON file did not contain valid subjects, questions, papers, or students data.'
         };
       }
 
       return {
         success: true,
-        message: `Curriculum restored successfully! (${importedSubjects} subjects, ${importedQuestions} questions, ${importedPapers} question papers)`,
-        counts: { subjects: importedSubjects, questions: importedQuestions, papers: importedPapers }
+        message: `Curriculum and student roster restored successfully! (${importedSubjects} subjects, ${importedQuestions} questions, ${importedPapers} question papers, ${importedStudents} students)`,
+        counts: { subjects: importedSubjects, questions: importedQuestions, papers: importedPapers, students: importedStudents }
       };
     } catch (e: any) {
       console.error('Failed to import JSON data', e);
@@ -794,6 +800,56 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
   // STUDENT ACCOUNTS (UG NUMBER OF AI & DS)
   // ==========================================
 
+  static notifyDataUpdated(): void {
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(new CustomEvent('aids_data_updated'));
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  static async fetchStudentsFromServer(): Promise<StudentAccount[]> {
+    try {
+      const response = await fetch('/api/students');
+      if (response.ok) {
+        const json = await response.json();
+        if (json.success && Array.isArray(json.students)) {
+          this.saveStudentsLocally(json.students);
+          this.notifyDataUpdated();
+          return json.students;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not fetch students from server API, using local storage cache', e);
+    }
+    return this.getStudents();
+  }
+
+  static async syncWithServer(): Promise<StudentAccount[]> {
+    try {
+      const localStudents = this.getStudents();
+      const response = await fetch('/api/students/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ students: localStudents })
+      });
+
+      if (response.ok) {
+        const json = await response.json();
+        if (json.success && Array.isArray(json.students)) {
+          this.saveStudentsLocally(json.students);
+          this.notifyDataUpdated();
+          return json.students;
+        }
+      }
+    } catch (e) {
+      console.warn('Server sync failed, running with local data', e);
+    }
+    return this.getStudents();
+  }
+
   static getStudents(): StudentAccount[] {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.STUDENTS);
@@ -824,12 +880,26 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
     return emptyStudents;
   }
 
-  static saveStudents(students: StudentAccount[]): void {
+  private static saveStudentsLocally(students: StudentAccount[]): void {
     try {
       localStorage.setItem(STORAGE_KEYS.STUDENTS, JSON.stringify(students));
     } catch (e) {
       console.error('Failed to save students to localStorage', e);
     }
+  }
+
+  static saveStudents(students: StudentAccount[]): void {
+    this.saveStudentsLocally(students);
+    this.notifyDataUpdated();
+
+    // Asynchronously synchronize with server
+    fetch('/api/students/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ students })
+    }).catch(err => {
+      console.warn('Background student sync to server failed:', err);
+    });
   }
 
   static getCurrentStudent(): StudentAccount | null {
@@ -868,6 +938,79 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
     return students.some(s => s.ugNumber.trim().toUpperCase() === clean);
   }
 
+  static async registerStudentAsync(data: {
+    ugNumber: string;
+    fullName: string;
+    email: string;
+    semester: number;
+    password: string;
+    department?: string;
+  }): Promise<{ success: boolean; message: string; student?: StudentAccount }> {
+    const ugClean = data.ugNumber.trim().toUpperCase();
+    if (!ugClean) {
+      return { success: false, message: 'Student ID (UG Number) is required.' };
+    }
+    if (!data.fullName.trim()) {
+      return { success: false, message: 'Full name is required.' };
+    }
+    if (!data.password || data.password.length < 4) {
+      return { success: false, message: 'Password must be at least 4 characters.' };
+    }
+
+    const students = this.getStudents();
+    const existing = students.find(s => s.ugNumber.trim().toUpperCase() === ugClean);
+    if (existing) {
+      return {
+        success: false,
+        message: `Account Creation Limit: UG Number "${ugClean}" already has an account. Each UG Number can only create one account. Please sign in with your password.`
+      };
+    }
+
+    const newStudent: StudentAccount = {
+      ugNumber: ugClean,
+      fullName: data.fullName.trim(),
+      email: data.email.trim() || `${ugClean.toLowerCase()}@college.edu`,
+      semester: Number(data.semester) || 1,
+      password: data.password,
+      createdAt: Date.now(),
+      lastLoginAt: Date.now(),
+      department: data.department || 'Artificial Intelligence & Data Science'
+    };
+
+    // Save locally immediately
+    students.unshift(newStudent);
+    this.saveStudentsLocally(students);
+    this.setCurrentStudent(newStudent);
+    this.notifyDataUpdated();
+
+    // Persist to Server API
+    try {
+      const res = await fetch('/api/students/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newStudent)
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (json.student) {
+          return {
+            success: true,
+            message: json.message || `Account created successfully for ${newStudent.fullName} (${newStudent.ugNumber})!`,
+            student: json.student
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('Server registration call warning, local account preserved:', err);
+    }
+
+    return {
+      success: true,
+      message: `Account created successfully for ${newStudent.fullName} (${newStudent.ugNumber})! Details saved in Admin Excel Database.`,
+      student: newStudent
+    };
+  }
+
   static registerStudent(data: {
     ugNumber: string;
     fullName: string;
@@ -892,7 +1035,7 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
     if (existing) {
       return {
         success: false,
-        message: `Account Creation Limit: UG Number "${ugClean}" is already registered. Each UG Number can only create one account. Please sign in with your password.`
+        message: `Account Creation Limit: UG Number "${ugClean}" already has an account. Each UG Number can only create one account. Please sign in with your password.`
       };
     }
 
@@ -908,13 +1051,98 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
     };
 
     students.unshift(newStudent);
-    this.saveStudents(students);
+    this.saveStudentsLocally(students);
     this.setCurrentStudent(newStudent);
+    this.notifyDataUpdated();
+
+    // Background server persist
+    fetch('/api/students/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newStudent)
+    }).catch(err => {
+      console.warn('Background server registration error:', err);
+    });
 
     return {
       success: true,
       message: `Account created successfully for ${newStudent.fullName} (${newStudent.ugNumber})!`,
       student: newStudent
+    };
+  }
+
+  static async loginStudentAsync(ugNumber: string, password: string): Promise<{ success: boolean; message: string; student?: StudentAccount }> {
+    const ugClean = ugNumber.trim().toUpperCase();
+    if (!ugClean) {
+      return { success: false, message: 'Please enter your UG Number.' };
+    }
+    if (!password) {
+      return { success: false, message: 'Please enter your password.' };
+    }
+
+    // Check local accounts first
+    const students = this.getStudents();
+    let found = students.find(s => s.ugNumber.toUpperCase() === ugClean);
+
+    // If not found locally, try server
+    if (!found) {
+      try {
+        const res = await fetch('/api/students/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ugNumber: ugClean, password })
+        });
+        const data = await res.json();
+        if (res.ok && data.success && data.student) {
+          found = data.student;
+          students.unshift(found!);
+          this.saveStudentsLocally(students);
+          this.setCurrentStudent(found!);
+          this.notifyDataUpdated();
+          return {
+            success: true,
+            message: data.message || `Welcome back, ${found!.fullName}!`,
+            student: found!
+          };
+        } else if (data.message) {
+          return { success: false, message: data.message };
+        }
+      } catch (err) {
+        console.warn('Server login error:', err);
+      }
+    }
+
+    if (!found) {
+      return {
+        success: false,
+        message: `No student account found with UG Number "${ugClean}". Please create an account.`
+      };
+    }
+
+    if (found.password !== password) {
+      return {
+        success: false,
+        message: 'Incorrect password. Please verify your credentials and try again.'
+      };
+    }
+
+    // Update lastLoginAt
+    found.lastLoginAt = Date.now();
+    this.saveStudentsLocally(students);
+    this.setCurrentStudent(found);
+    this.notifyDataUpdated();
+
+    // Tell server in background
+    fetch('/api/students/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ugNumber: ugClean, password })
+    }).catch(() => {});
+
+    return {
+      success: true,
+      message: `Welcome back, ${found.fullName}!`,
+      student: found
     };
   }
 
@@ -946,8 +1174,16 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
 
     // Update lastLoginAt
     found.lastLoginAt = Date.now();
-    this.saveStudents(students);
+    this.saveStudentsLocally(students);
     this.setCurrentStudent(found);
+    this.notifyDataUpdated();
+
+    // Async server notify
+    fetch('/api/students/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ugNumber: ugClean, password })
+    }).catch(() => {});
 
     return {
       success: true,
@@ -958,23 +1194,83 @@ Details: ${syllabus.notes || 'Official Department Course Syllabus'}`;
 
   static logoutStudent(): void {
     this.setCurrentStudent(null);
+    this.notifyDataUpdated();
   }
 
   static deleteStudent(ugNumber: string): boolean {
+    const ugClean = ugNumber.trim().toUpperCase();
     const students = this.getStudents();
-    const filtered = students.filter(s => s.ugNumber.toUpperCase() !== ugNumber.toUpperCase());
+    const filtered = students.filter(s => s.ugNumber.toUpperCase() !== ugClean);
     if (filtered.length === students.length) return false;
-    this.saveStudents(filtered);
+    this.saveStudentsLocally(filtered);
     const current = this.getCurrentStudent();
-    if (current && current.ugNumber.toUpperCase() === ugNumber.toUpperCase()) {
+    if (current && current.ugNumber.toUpperCase() === ugClean) {
       this.logoutStudent();
     }
+    this.notifyDataUpdated();
+
+    // Server delete
+    fetch(`/api/students/${encodeURIComponent(ugClean)}`, {
+      method: 'DELETE'
+    }).catch(err => console.warn('Server delete failed:', err));
+
     return true;
   }
 
   static clearAllStudents(): void {
-    this.saveStudents([]);
+    this.saveStudentsLocally([]);
     this.logoutStudent();
+    this.notifyDataUpdated();
+
+    // Server clear
+    fetch('/api/students', {
+      method: 'DELETE'
+    }).catch(err => console.warn('Server clear failed:', err));
+  }
+
+  static async bulkImportStudents(newStudents: StudentAccount[]): Promise<{ success: boolean; importedCount: number; total: number }> {
+    const current = this.getStudents();
+    const existingUgs = new Set(current.map(s => s.ugNumber.toUpperCase()));
+
+    let importedCount = 0;
+    newStudents.forEach(s => {
+      const ug = (s.ugNumber || '').trim().toUpperCase();
+      if (ug && !existingUgs.has(ug)) {
+        current.push({
+          ugNumber: ug,
+          fullName: (s.fullName || 'Student').trim(),
+          email: (s.email || `${ug.toLowerCase()}@college.edu`).trim(),
+          semester: Number(s.semester) || 1,
+          password: s.password || 'Student@123',
+          createdAt: s.createdAt || Date.now(),
+          lastLoginAt: s.lastLoginAt || undefined,
+          department: s.department || 'Artificial Intelligence & Data Science'
+        });
+        existingUgs.add(ug);
+        importedCount++;
+      }
+    });
+
+    current.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    this.saveStudentsLocally(current);
+    this.notifyDataUpdated();
+
+    // Persist to server
+    try {
+      const res = await fetch('/api/students/bulk-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ students: newStudents })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return { success: true, importedCount: data.importedCount || importedCount, total: current.length };
+      }
+    } catch (e) {
+      console.warn('Server bulk import warning:', e);
+    }
+
+    return { success: true, importedCount, total: current.length };
   }
 
   // ===================== STUDENT CHAT SERVICE =====================

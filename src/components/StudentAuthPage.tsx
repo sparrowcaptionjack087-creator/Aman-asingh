@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   GraduationCap,
   Lock,
@@ -61,14 +61,19 @@ export const StudentAuthPage: React.FC<StudentAuthPageProps> = ({
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  const handleLogin = (e: React.FormEvent) => {
+  // Sync latest roster from server on load
+  useEffect(() => {
+    AcademicService.fetchStudentsFromServer().catch(() => {});
+  }, []);
+
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
     setSuccessMsg(null);
     setIsLoading(true);
 
     try {
-      const res = AcademicService.loginStudent(loginUgNumber, loginPassword);
+      const res = await AcademicService.loginStudentAsync(loginUgNumber, loginPassword);
       if (res.success && res.student) {
         setSuccessMsg(res.message);
         setTimeout(() => {
@@ -84,7 +89,7 @@ export const StudentAuthPage: React.FC<StudentAuthPageProps> = ({
     }
   };
 
-  const handleRegister = (e: React.FormEvent) => {
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
     setSuccessMsg(null);
@@ -123,7 +128,7 @@ export const StudentAuthPage: React.FC<StudentAuthPageProps> = ({
     setIsLoading(true);
 
     try {
-      const res = AcademicService.registerStudent({
+      const res = await AcademicService.registerStudentAsync({
         ugNumber: cleanUg,
         fullName: regFullName,
         email: regEmail,

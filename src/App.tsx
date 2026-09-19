@@ -80,6 +80,29 @@ export default function App() {
     setCurrentStudent(AcademicService.getCurrentStudent());
   };
 
+  // Initial server sync on boot and listen to cross-component data updates
+  useEffect(() => {
+    AcademicService.syncWithServer()
+      .then(() => {
+        refreshData();
+      })
+      .catch(err => {
+        console.warn('Backend sync warning:', err);
+      });
+
+    const handleUpdate = () => {
+      refreshData();
+    };
+
+    window.addEventListener('aids_data_updated', handleUpdate);
+    window.addEventListener('storage', handleUpdate);
+
+    return () => {
+      window.removeEventListener('aids_data_updated', handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
+    };
+  }, []);
+
   // Selection handlers
   const handleSelectSubject = (subjectId: string) => {
     setSelectedSubjectId(subjectId);
